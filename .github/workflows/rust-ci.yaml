@@ -52,12 +52,12 @@ jobs:
 
       - name: Run Clippy
         run: >
-          cargo clippy --locked --all-targets --
-            -D warnings
-            -D clippy::all
-            -D clippy::cargo
-            -D clippy::pedantic
-            -A clippy::cargo_common_metadata
+          cargo clippy --locked --all-targets -- \
+            -D warnings \
+            -D clippy::all \
+            -D clippy::cargo \
+            -D clippy::pedantic \
+            -A clippy::cargo_common_metadata \
             -A clippy::multiple_crate_versions
 
   test:
