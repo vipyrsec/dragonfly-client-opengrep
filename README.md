@@ -19,6 +19,22 @@ cargo test --locked --all-targets --no-fail-fast
 OpenGrep-dependent integration tests run when `OPENGREP_BIN` points to a reviewed
 OpenGrep executable. Other tests do not require the executable.
 
+## Package scanning
+
+For rule corpora without path-scoped rules, the worker prepares one canonical
+target directory for the complete package and invokes OpenGrep once. Files are
+identified by XXH3-128, size, and extension. The canonical directory contains
+one hardlink per unique identity; an on-disk alias manifest maps findings back
+to every original distribution path and Inspector URL. Only the compact
+identity index is retained in memory.
+
+Distributions are still downloaded, extracted, and hashed sequentially under
+their individual resource limits. If the package-wide OpenGrep invocation
+times out, the worker retries the already-prepared targets in bounded groups;
+it does not download, extract, or hash them again. Path-scoped rule corpora use
+the distribution-by-distribution compatibility path because content reuse
+would change their semantics.
+
 ## Container
 
 The release image downloads the reviewed OpenGrep executable and verifies its
