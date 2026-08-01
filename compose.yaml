@@ -1,0 +1,9 @@
+---
+services:
+  dragonfly-client-opengrep:
+    build:
+      context: .
+    container_name: dragonfly-client-opengrep
+    image: ghcr.io/vipyrsec/dragonfly-client-opengrep:latest
+    volumes:
+      - ./Config.toml:/app/Config.toml:ro

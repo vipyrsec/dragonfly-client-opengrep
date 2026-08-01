@@ -1,0 +1,108 @@
+---
+default_language_version:
+  python: python3
+  node: system
+
+repos:
+  - repo: meta
+    hooks:
+      - id: check-hooks-apply
+      - id: check-useless-excludes
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args:
+          - --markdown-linebreak-ext=md
+        exclude: \.gitignore
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Format Rust files
+        language: system
+        entry: cargo fmt
+        types:
+          - rust
+        pass_filenames: false
+
+      - id: cargo-check
+        name: cargo check
+        description: Check Rust files
+        language: system
+        entry: cargo check
+        types:
+          - rust
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Lint Rust files using Clippy
+        language: system
+        entry: cargo clippy
+        args:
+          - --
+          - -D
+          - clippy::all
+          - -D
+          - clippy::cargo
+          - -D
+          - clippy::pedantic
+          - -A
+          - clippy::cargo_common_metadata
+          - -A
+          - clippy::multiple_crate_versions
+        types:
+          - rust
+        pass_filenames: false
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: ba8f7ac0e0c0d25bae15b628b634316e7d201db5  # frozen: 0.36.1
+    hooks:
+      - id: check-github-workflows
+
+  - repo: https://github.com/lyz-code/yamlfix
+    rev: f857ca370af3db7e5e181373d45c06a148fac3f8  # frozen: 1.19.1
+    hooks:
+      - id: yamlfix
+        args:
+          - --config-file
+          - .yamlfix.toml
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: cba56bcde1fdd01c1deb3f945e69764c291a6530  # frozen: v1.38.0
+    hooks:
+      - id: yamllint
+        args:
+          - --strict
+
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: 76b3d32d3f4b965e1d6425253c59407420ae2c43  # frozen: v0.47.0
+    hooks:
+      - id: markdownlint-fix
+
+  - repo: https://github.com/ComPWA/taplo-pre-commit
+    rev: ade0f95ddcf661c697d4670d2cfcbe95d0048a0a  # frozen: v0.9.3
+    hooks:
+      - id: taplo-format
+      - id: taplo-lint
+        args:
+          - --no-schema
+
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: b546b77c44c466a54a42af5499dcc0dcc1a3193f  # frozen: v1.22.0
+    hooks:
+      - id: zizmor
+        args:
+          - --no-progress  # https://github.com/zizmorcore/zizmor/issues/582
+          - --fix
+
+  - repo: https://github.com/sirwart/ripsecrets
+    rev: 7d94620933e79b8acaa0cd9e60e9864b07673d86  # frozen: v0.1.11
+    hooks:
+      - id: ripsecrets
