@@ -1,0 +1,41 @@
+---
+version: 2
+
+multi-ecosystem-groups:
+  infrastructure-dependencies:
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps(infra)
+    labels:
+      - dependencies
+      - infra
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    multi-ecosystem-group: infrastructure-dependencies
+    patterns:
+      - '*'
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps(app)
+    labels:
+      - dependencies
+      - apps
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - '*'
+      application-dependencies:
+        applies-to: version-updates
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
