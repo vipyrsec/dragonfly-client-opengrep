@@ -17,10 +17,10 @@ use color_eyre::{
 use reqwest::{blocking::Client, Url};
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tempfile::{tempdir, tempfile, TempDir};
 use tracing::{info, warn};
 use walkdir::WalkDir;
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::{
     app_config::APP_CONFIG,
@@ -102,7 +102,8 @@ struct ScanJobOutcome {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct FileIdentity {
-    digest: [u8; 32],
+    digest: u128,
+    size: u64,
     extension: Option<OsString>,
 }
 
@@ -617,11 +618,12 @@ fn prepare_target(
     let mut reused = Vec::new();
     for path in paths {
         ensure_scan_time_remaining(deadline)?;
-        if path.metadata()?.len() > APP_CONFIG.max_scan_size {
+        let file_size = path.metadata()?.len();
+        if file_size > APP_CONFIG.max_scan_size {
             continue;
         }
         let relative_path = relative_target_path(&path, target_directory)?;
-        let identity = hash_file(&path, deadline)?;
+        let identity = hash_file(&path, file_size, deadline)?;
         if let Some(cached_findings) = cache
             .findings_by_file
             .get(&identity)
@@ -668,9 +670,9 @@ fn prepare_distribution_target(
     }
 }
 
-fn hash_file(path: &Path, deadline: Instant) -> Result<FileIdentity> {
+fn hash_file(path: &Path, size: u64, deadline: Instant) -> Result<FileIdentity> {
     let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Xxh3::new();
     let mut buffer = [0_u8; 8192];
     loop {
         ensure_scan_time_remaining(deadline)?;
@@ -681,7 +683,8 @@ fn hash_file(path: &Path, deadline: Instant) -> Result<FileIdentity> {
         hasher.update(&buffer[..read]);
     }
     Ok(FileIdentity {
-        digest: hasher.finalize().into(),
+        digest: hasher.digest128(),
+        size,
         extension: path.extension().map(OsString::from),
     })
 }
@@ -828,15 +831,16 @@ fn truncate(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_findings, cache_completed_file_results, is_timeout_error, materialize_rules,
-        prepare_target, rules_allow_content_reuse, run_opengrep, safe_relative_path,
-        synthesize_local_alias_findings, synthesize_reused_findings, validate_staging_origin,
-        PackageScanCache, MAX_FINDINGS, SCAN_DEADLINE,
+        append_findings, cache_completed_file_results, hash_file, is_timeout_error,
+        materialize_rules, prepare_target, rules_allow_content_reuse, run_opengrep,
+        safe_relative_path, synthesize_local_alias_findings, synthesize_reused_findings,
+        validate_staging_origin, PackageScanCache, MAX_FINDINGS, SCAN_DEADLINE,
     };
     use crate::client::{OpenGrepFinding, OpenGrepRulesResponse};
     use reqwest::Url;
     use std::{
         collections::HashMap,
+        ffi::OsStr,
         path::{Path, PathBuf},
         time::{Duration, Instant},
     };
@@ -1144,6 +1148,21 @@ printf '%s' '{
         let mut bounded = vec![reused[0].clone(); MAX_FINDINGS];
         assert!(append_findings(&mut bounded, reused).is_err());
         assert_eq!(bounded.len(), MAX_FINDINGS);
+    }
+
+    #[test]
+    fn file_identity_uses_xxh3_128_and_size() {
+        let target = tempdir().unwrap();
+        let path = target.path().join("sample.py");
+        let contents = b"print('sample')\n";
+        std::fs::write(&path, contents).unwrap();
+
+        let size = u64::try_from(contents.len()).unwrap();
+        let identity = hash_file(&path, size, Instant::now() + SCAN_DEADLINE).unwrap();
+
+        assert_eq!(identity.digest, xxhash_rust::xxh3::xxh3_128(contents));
+        assert_eq!(identity.size, size);
+        assert_eq!(identity.extension.as_deref(), Some(OsStr::new("py")));
     }
 
     #[test]
