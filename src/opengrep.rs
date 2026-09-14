@@ -33,7 +33,10 @@ use crate::{
     utils::create_inspector_url,
 };
 
-const STAGING_ORIGIN: &str = "https://dragonfly-staging.vipyrsec.com";
+const API_ORIGINS: [&str; 2] = [
+    "https://dragonfly-staging.vipyrsec.com",
+    "https://dragonfly.vipyrsec.com",
+];
 const MAX_FINDINGS: usize = 500;
 const MAX_OPENGREP_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 const SCAN_DEADLINE: Duration = Duration::from_secs(60);
@@ -323,14 +326,14 @@ pub struct OpenGrepClient {
 }
 
 impl OpenGrepClient {
-    /// Build a staging-pinned shadow client and load its initial corpus.
+    /// Build an origin-validated shadow client and load its initial corpus.
     ///
     /// # Errors
     ///
     /// Returns an error when the origin fence, HTTP clients, rule retrieval,
     /// or safe rule materialization fails.
     pub fn new(binary: PathBuf) -> Result<Self> {
-        validate_staging_origin(&APP_CONFIG.base_url)?;
+        validate_api_origin(&APP_CONFIG.base_url)?;
         let api_client = build_api_http_client(
             &APP_CONFIG.cf_access_client_id,
             &APP_CONFIG.cf_access_client_secret,
@@ -660,24 +663,22 @@ fn append_findings(
     Ok(())
 }
 
-/// Require the exact staging API origin without paths, credentials, or queries.
+/// Require a supported Dragonfly API origin without paths, credentials, or queries.
 ///
 /// # Errors
 ///
-/// Returns an error when the URL is invalid or is not the staging origin.
-pub fn validate_staging_origin(base_url: &str) -> Result<()> {
+/// Returns an error when the URL is invalid or is not a supported Dragonfly origin.
+pub fn validate_api_origin(base_url: &str) -> Result<()> {
     let parsed = Url::parse(base_url)?;
-    let expected = Url::parse(STAGING_ORIGIN)?;
+
     ensure!(
-        parsed.scheme() == expected.scheme()
-            && parsed.host_str() == expected.host_str()
-            && parsed.port_or_known_default() == expected.port_or_known_default()
+        API_ORIGINS.contains(&parsed.origin().ascii_serialization().as_str())
             && parsed.path().trim_end_matches('/').is_empty()
             && parsed.query().is_none()
             && parsed.fragment().is_none()
             && parsed.username().is_empty()
             && parsed.password().is_none(),
-        "OpenGrep shadow worker requires the staging API origin"
+        "OpenGrep worker requires a supported Dragonfly API origin"
     );
     Ok(())
 }
@@ -1021,7 +1022,7 @@ fn truncate(value: &str, limit: usize) -> String {
 mod tests {
     use super::{
         append_findings, hash_file, is_timeout_error, materialize_rules, rules_allow_content_reuse,
-        run_opengrep, safe_relative_path, validate_staging_origin, PackageTarget, MAX_FINDINGS,
+        run_opengrep, safe_relative_path, validate_api_origin, PackageTarget, MAX_FINDINGS,
         SCAN_DEADLINE,
     };
     use crate::client::{OpenGrepFinding, OpenGrepRulesResponse};
@@ -1035,17 +1036,23 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn shadow_origin_is_pinned_to_staging() {
-        validate_staging_origin("https://dragonfly-staging.vipyrsec.com").unwrap();
-        validate_staging_origin("https://dragonfly-staging.vipyrsec.com/").unwrap();
+    fn shadow_origin_is_restricted_to_supported_apis() {
+        validate_api_origin("https://dragonfly-staging.vipyrsec.com").unwrap();
+        validate_api_origin("https://dragonfly-staging.vipyrsec.com/").unwrap();
+
+        validate_api_origin("https://dragonfly.vipyrsec.com").unwrap();
+        validate_api_origin("https://dragonfly.vipyrsec.com/").unwrap();
 
         for rejected in [
-            "https://dragonfly.vipyrsec.com",
+            "https://dragonfly.vipyrsec.com.evil.example",
+            "https://user@dragonfly.vipyrsec.com",
+            "https://dragonfly.vipyrsec.com:444",
+            "https://dragonfly.vipyrsec.com/#fragment",
             "http://dragonfly-staging.vipyrsec.com",
             "https://dragonfly-staging.vipyrsec.com/other",
             "https://dragonfly-staging.vipyrsec.com?redirect=production",
         ] {
-            assert!(validate_staging_origin(rejected).is_err());
+            assert!(validate_api_origin(rejected).is_err());
         }
     }
 
