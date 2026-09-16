@@ -17,6 +17,7 @@ use color_eyre::{
 use reqwest::{blocking::Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::{tempdir, tempfile, TempDir};
 use tracing::{info, warn};
 use walkdir::WalkDir;
@@ -115,6 +116,7 @@ struct ScanJobOutcome {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct FileIdentity {
     digest: u128,
+    sha256: String,
     size: u64,
     extension: Option<OsString>,
 }
@@ -372,6 +374,21 @@ impl OpenGrepClient {
         let rules_hash = response.hash.clone();
         let rules_directory = materialize_rules(&response)?;
         let content_reuse_safe = rules_allow_content_reuse(&binary, rules_directory.path())?;
+        let mut reuse_cache = crate::reuse_cache::ReuseCache::new(
+            APP_CONFIG.reuse_cache_mode,
+            APP_CONFIG.reuse_cache_entries,
+            APP_CONFIG.reuse_cache_bytes,
+        );
+        if APP_CONFIG.reuse_cache_database {
+            reuse_cache.set_database(crate::durable_cache::DurableCache::new(
+                api_client.clone(),
+                &APP_CONFIG.base_url,
+                "opengrep",
+                &response.hash,
+                &response.rules,
+                Some(&binary),
+            )?);
+        }
         Ok(Self {
             api_client,
             download_client,
@@ -380,11 +397,7 @@ impl OpenGrepClient {
             rules_directory,
             content_reuse_safe,
             rules_hash,
-            reuse_cache: crate::reuse_cache::ReuseCache::new(
-                APP_CONFIG.reuse_cache_mode,
-                APP_CONFIG.reuse_cache_entries,
-                APP_CONFIG.reuse_cache_bytes,
-            ),
+            reuse_cache,
         })
     }
 
@@ -398,6 +411,17 @@ impl OpenGrepClient {
         let rules_directory = materialize_rules(&response)?;
         let content_reuse_safe = rules_allow_content_reuse(&self.binary, rules_directory.path())?;
         self.reuse_cache.clear();
+        if APP_CONFIG.reuse_cache_database {
+            self.reuse_cache
+                .set_database(crate::durable_cache::DurableCache::new(
+                    self.api_client.clone(),
+                    &self.base_url,
+                    "opengrep",
+                    &response.hash,
+                    &response.rules,
+                    Some(&self.binary),
+                )?);
+        }
         self.rules_hash = response.hash;
         self.rules_directory = rules_directory;
         self.content_reuse_safe = content_reuse_safe;
@@ -417,8 +441,10 @@ impl OpenGrepClient {
     #[must_use]
     pub fn run_job(&self, job: &Job) -> ReportedOpenGrepResult {
         let started_at = Instant::now();
+        self.reuse_cache.begin_job(job);
         let mut stats = crate::reuse_cache::CacheStats::new("opengrep", self.reuse_cache.mode);
         let result = self.scan_job(job, &mut stats);
+        self.reuse_cache.flush(&mut stats);
         stats.emit();
         let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let result = match result {
@@ -536,6 +562,36 @@ impl OpenGrepClient {
         )
     }
 
+    fn prefetch_database(
+        &self,
+        package_target: &PackageTarget,
+        stats: &mut crate::reuse_cache::CacheStats,
+    ) {
+        if self.reuse_cache.uses_database() {
+            let keys = package_target
+                .identities
+                .keys()
+                .filter_map(|identity| {
+                    let language = identity
+                        .extension
+                        .as_ref()
+                        .map_or(Some(""), |value| value.to_str())?;
+                    if language.len() > 32 {
+                        return None;
+                    }
+                    Some((
+                        format!("sha256:{}:{:?}", identity.sha256, identity.extension),
+                        crate::durable_cache::Key {
+                            file_digest: identity.sha256.clone(),
+                            language: language.to_owned(),
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>();
+            self.reuse_cache.prefetch(&keys, stats);
+        }
+    }
+
     fn scan_prepared_package(
         &self,
         package_target: &mut PackageTarget,
@@ -547,12 +603,17 @@ impl OpenGrepClient {
         let mut findings = Vec::new();
         let mut reused_findings = Vec::new();
         let mut pending = Vec::new();
+        self.prefetch_database(package_target, stats);
         for (identity, target_id) in &package_target.identities {
             let path = package_target.target_path(*target_id, identity.extension.as_deref());
-            let key = format!(
-                "{:032x}:{}:{:?}",
-                identity.digest, identity.size, identity.extension
-            );
+            let key = if self.reuse_cache.uses_database() {
+                format!("sha256:{}:{:?}", identity.sha256, identity.extension)
+            } else {
+                format!(
+                    "{:032x}:{}:{:?}",
+                    identity.digest, identity.size, identity.extension
+                )
+            };
             let cached = self
                 .reuse_cache
                 .lookup::<Vec<OpenGrepFinding>>(&key, &path, stats);
@@ -1089,6 +1150,7 @@ fn is_timeout_error(error: &color_eyre::Report) -> bool {
 fn hash_file(path: &Path, size: u64, deadline: Instant) -> Result<FileIdentity> {
     let mut file = File::open(path)?;
     let mut hasher = Xxh3::new();
+    let mut sha256 = Sha256::new();
     let mut buffer = [0_u8; 8192];
     loop {
         ensure_scan_time_remaining(deadline)?;
@@ -1097,9 +1159,11 @@ fn hash_file(path: &Path, size: u64, deadline: Instant) -> Result<FileIdentity> 
             break;
         }
         hasher.update(&buffer[..read]);
+        sha256.update(&buffer[..read]);
     }
     Ok(FileIdentity {
         digest: hasher.digest128(),
+        sha256: format!("{:x}", sha256.finalize()),
         size,
         extension: path.extension().map(OsString::from),
     })

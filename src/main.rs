@@ -69,6 +69,10 @@ fn main() -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or(default_env_filter);
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
+    ensure!(
+        !APP_CONFIG.reuse_cache_database || APP_CONFIG.threads == 1,
+        "Database cache requires one scan thread"
+    );
     ensure!(APP_CONFIG.reuse_cache_mode != dragonfly_client_opengrep::reuse_cache::CacheMode::Reuse || APP_CONFIG.threads == 1,
         "Cross-package reuse requires DRAGONFLY_THREADS=1 so validation can invalidate the entire active job");
     ensure!(
