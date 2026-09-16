@@ -56,7 +56,7 @@ pub fn send_opengrep_result(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{fetch_opengrep_jobs, fetch_opengrep_rules, send_opengrep_result};
     use crate::client::{build_api_http_client, OpenGrepScanResult, SubmitOpenGrepResultsSuccess};
     use std::{
@@ -69,7 +69,7 @@ mod tests {
     const CLIENT_ID: &str = "test-client.access";
     const CLIENT_SECRET: &str = "test-secret";
 
-    fn serve_once(response_body: &str) -> (String, mpsc::Receiver<String>) {
+    pub(crate) fn serve_once(response_body: &str) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let response_body = response_body.to_owned();

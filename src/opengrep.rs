@@ -616,6 +616,8 @@ impl OpenGrepClient {
         } else if !package_target.is_empty() {
             findings = package_target.expand_findings(reused_findings)?;
         }
+        ensure!(stats.mismatched_files == 0 && !(stats.reused_files > 0 && self.reuse_cache.is_disabled()),
+            "Cross-package cache validation failed; reuse disabled and this job's cached results discarded");
         let partial_reason = (!warnings.is_empty()).then(|| truncate(&warnings.join("; "), 2048));
         Ok(ScanJobOutcome {
             findings,
@@ -883,7 +885,21 @@ fn rules_allow_content_reuse(binary: &Path, rules_directory: &Path) -> Result<bo
     let parsed_rules = read_bounded(&mut stdout_file)?;
     let rule_count = parsed_rules.matches("Rule.id = (").count();
     ensure!(rule_count > 0, "OpenGrep rule inspection returned no rules");
-    Ok(rule_count == parsed_rules.matches("paths = None;").count())
+    let normalized = parsed_rules
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Only plain single-file SAST search/taint rules are eligible. Options can
+    // enable interfile analysis; dependencies, validators and other modes can
+    // depend on package context even when paths are unrestricted.
+    Ok(rule_count == normalized.matches("paths = None;").count()
+        && rule_count == normalized.matches("options = None;").count()
+        && rule_count == normalized.matches("dependency_formula = None;").count()
+        && rule_count == normalized.matches("validators = None;").count()
+        && rule_count == normalized.matches("product = `SAST;").count()
+        && rule_count
+            == normalized.matches("mode = `Search").count()
+                + normalized.matches("mode = `Taint").count())
 }
 
 fn safe_relative_path(value: &str) -> Result<PathBuf> {
@@ -1196,6 +1212,28 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    fn installed_opengrep_binary() -> Option<PathBuf> {
+        static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let binary = std::env::var_os("OPENGREP_BIN").map(PathBuf::from)?;
+        // The portable executable unpacks shared libraries on first use. Finish
+        // that cold start before parallel engine tests use the same cache.
+        READY.get_or_init(|| {
+            let output = std::process::Command::new(&binary)
+                .arg("--version")
+                .env("HOME", "/tmp")
+                .env("XDG_CACHE_HOME", "/tmp")
+                .env("OPENGREP_ENABLE_VERSION_CHECK", "0")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        });
+        Some(binary)
+    }
+
     fn reuse_test_client(
         binary: PathBuf,
         mode: crate::reuse_cache::CacheMode,
@@ -1230,9 +1268,109 @@ rules:
     }
 
     #[test]
+    fn sampled_mismatch_rejects_previously_selected_cache_hits() {
+        use crate::reuse_cache::{CacheMode, CacheStats};
+        let Some(binary) = installed_opengrep_binary() else {
+            return;
+        };
+        let client = reuse_test_client(binary, CacheMode::Reuse);
+        let source = tempdir().unwrap();
+        std::fs::write(source.path().join("one.py"), "exec('one')\n").unwrap();
+        std::fs::write(source.path().join("two.py"), "exec('two')\n").unwrap();
+        let mut target = PackageTarget::new().unwrap();
+        let plan = target
+            .plan_distribution(source.path(), Instant::now() + SCAN_DEADLINE)
+            .unwrap();
+        target
+            .commit_distribution(plan, Url::parse("https://inspector.example/").unwrap())
+            .unwrap();
+        let mut stats = CacheStats::new("opengrep", CacheMode::Reuse);
+        for (identity, target_id) in &target.identities {
+            let path = target.target_path(*target_id, identity.extension.as_deref());
+            let key = format!(
+                "{:032x}:{}:{:?}",
+                identity.digest, identity.size, identity.extension
+            );
+            client.reuse_cache.insert(
+                key,
+                &path,
+                &Vec::<crate::client::OpenGrepFinding>::new(),
+                &mut stats,
+            );
+        }
+        for _ in 0..98 {
+            assert!(client.reuse_cache.should_reuse());
+        }
+        let job = crate::client::Job {
+            hash: "snapshot".into(),
+            name: "test".into(),
+            version: "1".into(),
+            distributions: Vec::new(),
+            attempt: 1,
+            assignment_id: "lease".into(),
+        };
+        let outcome = client.scan_prepared_package(&mut target, 1, Vec::new(), &job, &mut stats);
+        assert!(outcome.is_err());
+        assert_eq!(stats.reused_files, 1);
+        assert_eq!(stats.mismatched_files, 1);
+        assert!(client.reuse_cache.is_disabled());
+    }
+
+    #[test]
+    fn production_report_serializes_flat_success_and_failure_with_metrics() {
+        use crate::client::{
+            OpenGrepScanResult, SubmitOpenGrepResultsError, SubmitOpenGrepResultsSuccess,
+        };
+        use crate::reuse_cache::{CacheMode, CacheStats};
+        for success in [true, false] {
+            let result = if success {
+                OpenGrepScanResult::Success(SubmitOpenGrepResultsSuccess {
+                    name: "test".into(),
+                    version: "1".into(),
+                    attempt: 1,
+                    assignment_id: "lease".into(),
+                    commit: "rules".into(),
+                    duration_ms: 123,
+                    findings: Vec::new(),
+                    partial_reason: None,
+                })
+            } else {
+                OpenGrepScanResult::Error(SubmitOpenGrepResultsError {
+                    name: "test".into(),
+                    version: "1".into(),
+                    attempt: 1,
+                    assignment_id: "lease".into(),
+                    duration_ms: 123,
+                    reason: "failure".into(),
+                })
+            };
+            let mut metrics = CacheStats::new("opengrep", CacheMode::Reuse);
+            metrics.reused_files = 2;
+            let report = super::ReportedOpenGrepResult {
+                result,
+                scan_reuse: metrics,
+            };
+            let (base_url, request) = crate::client::serve_once("");
+            let http = reqwest::blocking::Client::new();
+            crate::client::send_opengrep_result(&http, &base_url, &report).unwrap();
+            let request = request.recv().unwrap();
+            assert!(request.starts_with("PUT /opengrep/package HTTP/1.1\r\n"));
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["assignment_id"], "lease");
+            assert_eq!(body["name"], "test");
+            assert_eq!(body["scan_reuse"]["mode"], "reuse");
+            assert_eq!(body["scan_reuse"]["reused_files"], 2);
+            assert_eq!(body.get("findings").is_some(), success);
+            assert_eq!(body.get("reason").is_some(), !success);
+            assert!(body.get("result").is_none());
+        }
+    }
+
+    #[test]
     fn installed_opengrep_reuses_across_packages_and_rewrites_locations() {
         use crate::reuse_cache::{CacheMode, CacheStats};
-        let Some(binary) = std::env::var_os("OPENGREP_BIN").map(PathBuf::from) else {
+        let Some(binary) = installed_opengrep_binary() else {
             return;
         };
         for mode in [CacheMode::Observe, CacheMode::Reuse] {
@@ -1296,7 +1434,7 @@ rules:
     #[test]
     fn installed_opengrep_does_not_cache_partial_package_results() {
         use crate::reuse_cache::{CacheMode, CacheStats};
-        let Some(binary) = std::env::var_os("OPENGREP_BIN").map(PathBuf::from) else {
+        let Some(binary) = installed_opengrep_binary() else {
             return;
         };
         let client = reuse_test_client(binary, CacheMode::Reuse);
@@ -1385,7 +1523,7 @@ rules:
 
     #[test]
     fn installed_opengrep_structurally_detects_path_scoped_rules() {
-        let Some(binary) = std::env::var_os("OPENGREP_BIN").map(PathBuf::from) else {
+        let Some(binary) = installed_opengrep_binary() else {
             return;
         };
         let rules = tempdir().unwrap();
@@ -1403,11 +1541,14 @@ rules:
         )
         .unwrap();
         assert!(!rules_allow_content_reuse(&binary, rules.path()).unwrap());
+        std::fs::write(rules.path().join("rule.yml"),
+            "rules:\n  - id: interfile\n    message: test\n    languages: [python]\n    severity: ERROR\n    options: {interfile: true}\n    pattern: exec(...)\n").unwrap();
+        assert!(!rules_allow_content_reuse(&binary, rules.path()).unwrap());
     }
 
     #[test]
     fn installed_opengrep_matches_the_expected_json_contract() {
-        let Some(binary) = std::env::var_os("OPENGREP_BIN").map(PathBuf::from) else {
+        let Some(binary) = installed_opengrep_binary() else {
             return;
         };
         let rules = tempdir().unwrap();

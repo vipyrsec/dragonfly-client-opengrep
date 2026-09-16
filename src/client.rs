@@ -266,6 +266,9 @@ pub fn download_distribution_with_timeout(
 }
 
 #[cfg(test)]
+pub(crate) use methods::tests::serve_once;
+
+#[cfg(test)]
 mod tests {
     use super::{
         build_api_http_client, build_download_http_client, download_distribution_with_timeout,
