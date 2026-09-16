@@ -616,7 +616,7 @@ impl OpenGrepClient {
         } else if !package_target.is_empty() {
             findings = package_target.expand_findings(reused_findings)?;
         }
-        ensure!(stats.mismatched_files == 0 && !(stats.reused_files > 0 && self.reuse_cache.is_disabled()),
+        ensure!(!(stats.reused_files > 0 && self.reuse_cache.is_disabled()),
             "Cross-package cache validation failed; reuse disabled and this job's cached results discarded");
         let partial_reason = (!warnings.is_empty()).then(|| truncate(&warnings.join("; "), 2048));
         Ok(ScanJobOutcome {
@@ -1273,47 +1273,58 @@ rules:
         let Some(binary) = installed_opengrep_binary() else {
             return;
         };
-        let client = reuse_test_client(binary, CacheMode::Reuse);
-        let source = tempdir().unwrap();
-        std::fs::write(source.path().join("one.py"), "exec('one')\n").unwrap();
-        std::fs::write(source.path().join("two.py"), "exec('two')\n").unwrap();
-        let mut target = PackageTarget::new().unwrap();
-        let plan = target
-            .plan_distribution(source.path(), Instant::now() + SCAN_DEADLINE)
-            .unwrap();
-        target
-            .commit_distribution(plan, Url::parse("https://inspector.example/").unwrap())
-            .unwrap();
-        let mut stats = CacheStats::new("opengrep", CacheMode::Reuse);
-        for (identity, target_id) in &target.identities {
-            let path = target.target_path(*target_id, identity.extension.as_deref());
-            let key = format!(
-                "{:032x}:{}:{:?}",
-                identity.digest, identity.size, identity.extension
-            );
-            client.reuse_cache.insert(
-                key,
-                &path,
-                &Vec::<crate::client::OpenGrepFinding>::new(),
-                &mut stats,
-            );
+        for mode in [CacheMode::Observe, CacheMode::Reuse] {
+            let client = reuse_test_client(binary.clone(), mode);
+            let source = tempdir().unwrap();
+            std::fs::write(source.path().join("one.py"), "exec('one')\n").unwrap();
+            std::fs::write(source.path().join("two.py"), "exec('two')\n").unwrap();
+            let mut target = PackageTarget::new().unwrap();
+            let plan = target
+                .plan_distribution(source.path(), Instant::now() + SCAN_DEADLINE)
+                .unwrap();
+            target
+                .commit_distribution(plan, Url::parse("https://inspector.example/").unwrap())
+                .unwrap();
+            let mut stats = CacheStats::new("opengrep", mode);
+            for (identity, target_id) in &target.identities {
+                let path = target.target_path(*target_id, identity.extension.as_deref());
+                let key = format!(
+                    "{:032x}:{}:{:?}",
+                    identity.digest, identity.size, identity.extension
+                );
+                client.reuse_cache.insert(
+                    key,
+                    &path,
+                    &Vec::<crate::client::OpenGrepFinding>::new(),
+                    &mut stats,
+                );
+            }
+            if mode == CacheMode::Reuse {
+                for _ in 0..98 {
+                    assert!(client.reuse_cache.should_reuse());
+                }
+            }
+            let job = crate::client::Job {
+                hash: "snapshot".into(),
+                name: "test".into(),
+                version: "1".into(),
+                distributions: Vec::new(),
+                attempt: 1,
+                assignment_id: "lease".into(),
+            };
+            let outcome =
+                client.scan_prepared_package(&mut target, 1, Vec::new(), &job, &mut stats);
+            if mode == CacheMode::Reuse {
+                assert!(outcome.is_err());
+                assert_eq!(stats.reused_files, 1);
+                assert_eq!(stats.mismatched_files, 1);
+            } else {
+                assert_eq!(outcome.unwrap().findings.len(), 2);
+                assert_eq!(stats.reused_files, 0);
+                assert_eq!(stats.mismatched_files, 2);
+            }
+            assert!(client.reuse_cache.is_disabled());
         }
-        for _ in 0..98 {
-            assert!(client.reuse_cache.should_reuse());
-        }
-        let job = crate::client::Job {
-            hash: "snapshot".into(),
-            name: "test".into(),
-            version: "1".into(),
-            distributions: Vec::new(),
-            attempt: 1,
-            assignment_id: "lease".into(),
-        };
-        let outcome = client.scan_prepared_package(&mut target, 1, Vec::new(), &job, &mut stats);
-        assert!(outcome.is_err());
-        assert_eq!(stats.reused_files, 1);
-        assert_eq!(stats.mismatched_files, 1);
-        assert!(client.reuse_cache.is_disabled());
     }
 
     #[test]
