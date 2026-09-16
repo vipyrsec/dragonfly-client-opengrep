@@ -13,9 +13,11 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn run_job(client: &OpenGrepClient, job: &Job) {
+    let span = tracing::info_span!("scan_job", package = %job.name, version = %job.version, rules_commit = %job.hash);
+    let _entered = span.enter();
     let started_at = Instant::now();
     let result = client.run_job(job);
-    match &result {
+    match &result.result {
         OpenGrepScanResult::Success(success) => info!(
             event = "opengrep_scan_completed",
             package = %job.name,
@@ -67,6 +69,8 @@ fn main() -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or(default_env_filter);
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
+    ensure!(APP_CONFIG.reuse_cache_mode != dragonfly_client_opengrep::reuse_cache::CacheMode::Reuse || APP_CONFIG.threads == 1,
+        "Cross-package reuse requires DRAGONFLY_THREADS=1 so validation can invalidate the entire active job");
     ensure!(
         APP_CONFIG.threads > 0,
         "DRAGONFLY_THREADS must be greater than zero"
