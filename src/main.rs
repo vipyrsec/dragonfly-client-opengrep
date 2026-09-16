@@ -13,9 +13,11 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn run_job(client: &OpenGrepClient, job: &Job) {
+    let span = tracing::info_span!("scan_job", package = %job.name, version = %job.version, rules_commit = %job.hash);
+    let _entered = span.enter();
     let started_at = Instant::now();
     let result = client.run_job(job);
-    match &result {
+    match &result.result {
         OpenGrepScanResult::Success(success) => info!(
             event = "opengrep_scan_completed",
             package = %job.name,

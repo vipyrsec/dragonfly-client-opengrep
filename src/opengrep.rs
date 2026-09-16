@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error as StdError,
     ffi::OsString,
     fs::{self, File},
@@ -73,11 +73,19 @@ struct RawFinding {
 
 #[derive(Debug, Deserialize)]
 struct OpenGrepDocument {
+    #[serde(default)]
+    paths: ScannedPaths,
     results: Vec<RawFinding>,
     #[serde(default)]
     errors: Vec<Value>,
     #[serde(default)]
     skipped_rules: Vec<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ScannedPaths {
+    #[serde(default)]
+    scanned: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -95,6 +103,7 @@ impl StdError for ScanTimeout {}
 struct OpenGrepRun {
     findings: Vec<OpenGrepFinding>,
     warnings: Vec<String>,
+    scanned_paths: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -307,12 +316,31 @@ impl PackageTarget {
     }
 }
 
+fn content_findings(findings: &[OpenGrepFinding]) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    for finding in findings {
+        let mut finding = finding.clone();
+        finding.path.clear();
+        finding.inspector_url.clear();
+        values.push(serde_json::to_string(&finding)?);
+    }
+    values.sort_unstable();
+    Ok(values)
+}
+
 fn target_id_from_path(path: &str) -> Result<u64> {
     let stem = Path::new(path)
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or_else(|| color_eyre::eyre::eyre!("OpenGrep returned an invalid target path"))?;
     Ok(u64::from_str_radix(stem, 16)?)
+}
+
+#[derive(Serialize)]
+pub struct ReportedOpenGrepResult {
+    #[serde(flatten)]
+    pub result: OpenGrepScanResult,
+    scan_reuse: crate::reuse_cache::CacheStats,
 }
 
 pub struct OpenGrepClient {
@@ -323,6 +351,7 @@ pub struct OpenGrepClient {
     rules_directory: TempDir,
     content_reuse_safe: bool,
     pub rules_hash: String,
+    reuse_cache: crate::reuse_cache::ReuseCache,
 }
 
 impl OpenGrepClient {
@@ -351,6 +380,11 @@ impl OpenGrepClient {
             rules_directory,
             content_reuse_safe,
             rules_hash,
+            reuse_cache: crate::reuse_cache::ReuseCache::new(
+                APP_CONFIG.reuse_cache_mode,
+                APP_CONFIG.reuse_cache_entries,
+                APP_CONFIG.reuse_cache_bytes,
+            ),
         })
     }
 
@@ -363,6 +397,7 @@ impl OpenGrepClient {
         let response = fetch_opengrep_rules(&self.api_client, &self.base_url)?;
         let rules_directory = materialize_rules(&response)?;
         let content_reuse_safe = rules_allow_content_reuse(&self.binary, rules_directory.path())?;
+        self.reuse_cache.clear();
         self.rules_hash = response.hash;
         self.rules_directory = rules_directory;
         self.content_reuse_safe = content_reuse_safe;
@@ -380,11 +415,13 @@ impl OpenGrepClient {
 
     /// Scan one job and convert every failure into a bounded result payload.
     #[must_use]
-    pub fn run_job(&self, job: &Job) -> OpenGrepScanResult {
+    pub fn run_job(&self, job: &Job) -> ReportedOpenGrepResult {
         let started_at = Instant::now();
-        let result = self.scan_job(job);
+        let mut stats = crate::reuse_cache::CacheStats::new("opengrep", self.reuse_cache.mode);
+        let result = self.scan_job(job, &mut stats);
+        stats.emit();
         let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match result {
+        let result = match result {
             Ok(outcome) => OpenGrepScanResult::Success(SubmitOpenGrepResultsSuccess {
                 name: job.name.clone(),
                 version: job.version.clone(),
@@ -403,6 +440,10 @@ impl OpenGrepClient {
                 duration_ms,
                 reason: truncate(&format!("{error:#}"), 2048),
             }),
+        };
+        ReportedOpenGrepResult {
+            result,
+            scan_reuse: stats,
         }
     }
 
@@ -411,18 +452,30 @@ impl OpenGrepClient {
     /// # Errors
     ///
     /// Returns an HTTP or serialization error.
-    pub fn submit_result(&self, result: &OpenGrepScanResult) -> reqwest::Result<()> {
+    pub fn submit_result(&self, result: &ReportedOpenGrepResult) -> reqwest::Result<()> {
         send_opengrep_result(&self.api_client, &self.base_url, result)
     }
 
-    fn scan_job(&self, job: &Job) -> Result<ScanJobOutcome> {
+    fn scan_job(
+        &self,
+        job: &Job,
+        stats: &mut crate::reuse_cache::CacheStats,
+    ) -> Result<ScanJobOutcome> {
+        ensure!(
+            job.hash == self.rules_hash,
+            "job rules do not match the loaded rules snapshot"
+        );
         if self.content_reuse_safe {
-            return self.scan_job_batched(job);
+            return self.scan_job_batched(job, stats);
         }
         self.scan_job_by_distribution(job)
     }
 
-    fn scan_job_batched(&self, job: &Job) -> Result<ScanJobOutcome> {
+    fn scan_job_batched(
+        &self,
+        job: &Job,
+        stats: &mut crate::reuse_cache::CacheStats,
+    ) -> Result<ScanJobOutcome> {
         ensure!(
             job.distributions.len() <= APP_CONFIG.max_distributions,
             "package contains {} distributions, exceeding the {}-distribution limit",
@@ -474,42 +527,132 @@ impl OpenGrepClient {
             );
         }
 
+        self.scan_prepared_package(
+            &mut package_target,
+            prepared_distributions,
+            warnings,
+            job,
+            stats,
+        )
+    }
+
+    fn scan_prepared_package(
+        &self,
+        package_target: &mut PackageTarget,
+        prepared_distributions: u32,
+        mut warnings: Vec<String>,
+        job: &Job,
+        stats: &mut crate::reuse_cache::CacheStats,
+    ) -> Result<ScanJobOutcome> {
         let mut findings = Vec::new();
-        if !package_target.is_empty() {
-            let deadline = SCAN_DEADLINE
-                .checked_mul(prepared_distributions.max(1))
-                .ok_or_else(|| color_eyre::eyre::eyre!("package scan deadline overflowed"))?;
-            let inspector = Url::parse("https://opengrep-target.invalid/")?;
-            let package_run = match run_opengrep(
-                &self.binary,
-                self.rules_directory.path(),
-                package_target.path(),
-                &inspector,
-                deadline,
-            ) {
-                Ok(run) => run,
-                Err(error) if is_timeout_error(&error) => {
-                    warn!(
-                        package = %job.name,
-                        version = %job.version,
-                        "Package OpenGrep scan timed out; retrying bounded target groups"
-                    );
-                    run_opengrep_in_groups(
-                        &self.binary,
-                        self.rules_directory.path(),
-                        package_target.path(),
-                        &inspector,
-                    )?
+        let mut reused_findings = Vec::new();
+        let mut pending = Vec::new();
+        for (identity, target_id) in &package_target.identities {
+            let path = package_target.target_path(*target_id, identity.extension.as_deref());
+            let key = format!(
+                "{:032x}:{}:{:?}",
+                identity.digest, identity.size, identity.extension
+            );
+            let cached = self
+                .reuse_cache
+                .lookup::<Vec<OpenGrepFinding>>(&key, &path, stats);
+            if let Some(mut cached) = cached
+                .as_ref()
+                .filter(|_| self.reuse_cache.should_reuse())
+                .cloned()
+            {
+                let relative = relative_target_path(&path, package_target.path())?;
+                for finding in &mut cached {
+                    finding.path.clone_from(&relative);
                 }
-                Err(error) => return Err(error),
-            };
-            findings = package_target.expand_findings(package_run.findings)?;
+                append_findings(&mut reused_findings, cached)?;
+                fs::remove_file(&path)?;
+                stats.reused_files += 1;
+                stats.reused_bytes += identity.size;
+            } else {
+                pending.push((key, path, identity.size, cached));
+            }
+        }
+        if !pending.is_empty() {
+            stats.engine_files = u64::try_from(pending.len())?;
+            stats.engine_bytes = pending.iter().map(|(_, _, size, _)| size).sum();
+            let engine_started = Instant::now();
+            let package_run =
+                self.run_package_target(package_target.path(), prepared_distributions, job);
+            stats.engine_us = engine_started.elapsed().as_micros();
+            let package_run = package_run?;
+            let complete = package_run.warnings.is_empty() && warnings.is_empty();
+            let mut by_path: HashMap<String, Vec<OpenGrepFinding>> = HashMap::new();
+            for finding in &package_run.findings {
+                by_path
+                    .entry(finding.path.clone())
+                    .or_default()
+                    .push(finding.clone());
+            }
+            append_findings(&mut reused_findings, package_run.findings)?;
+            findings = package_target.expand_findings(reused_findings)?;
+            if complete {
+                for (key, path, _, previous) in pending {
+                    let relative = relative_target_path(&path, package_target.path())?;
+                    // No finding does not prove a file was scanned. Require engine coverage.
+                    if package_run.scanned_paths.contains(&relative) {
+                        let current = by_path.remove(&relative).unwrap_or_default();
+                        if let Some(previous) = previous {
+                            stats.validated_files += 1;
+                            if content_findings(&previous)? != content_findings(&current)? {
+                                stats.mismatched_files += 1;
+                                self.reuse_cache.disable();
+                                tracing::error!(
+                                    event = "scan_reuse_mismatch",
+                                    "Cached OpenGrep results differ from fresh scan"
+                                );
+                            }
+                        }
+                        self.reuse_cache.insert(key, &path, &current, stats);
+                    }
+                }
+            }
             warnings.extend(package_run.warnings);
+        } else if !package_target.is_empty() {
+            findings = package_target.expand_findings(reused_findings)?;
         }
         let partial_reason = (!warnings.is_empty()).then(|| truncate(&warnings.join("; "), 2048));
         Ok(ScanJobOutcome {
             findings,
             partial_reason,
+        })
+    }
+
+    fn run_package_target(
+        &self,
+        target: &Path,
+        distributions: u32,
+        job: &Job,
+    ) -> Result<OpenGrepRun> {
+        let deadline = SCAN_DEADLINE
+            .checked_mul(distributions.max(1))
+            .ok_or_else(|| color_eyre::eyre::eyre!("package scan deadline overflowed"))?;
+        let inspector = Url::parse("https://opengrep-target.invalid/")?;
+        run_opengrep(
+            &self.binary,
+            self.rules_directory.path(),
+            target,
+            &inspector,
+            deadline,
+        )
+        .or_else(|error| {
+            if is_timeout_error(&error) {
+                warn!(package = %job.name, version = %job.version,
+                        "Package OpenGrep scan timed out; retrying bounded target groups");
+                run_opengrep_in_groups(
+                    &self.binary,
+                    self.rules_directory.path(),
+                    target,
+                    &inspector,
+                )
+            } else {
+                Err(error)
+            }
         })
     }
 
@@ -604,7 +747,11 @@ fn run_opengrep_in_groups(
             &mut findings,
             &mut warnings,
         )? {
-            return Ok(OpenGrepRun { findings, warnings });
+            return Ok(OpenGrepRun {
+                findings,
+                warnings,
+                scanned_paths: HashSet::new(),
+            });
         }
         group = tempdir()?;
         group_size = 0;
@@ -620,7 +767,11 @@ fn run_opengrep_in_groups(
             &mut warnings,
         )?;
     }
-    Ok(OpenGrepRun { findings, warnings })
+    Ok(OpenGrepRun {
+        findings,
+        warnings,
+        scanned_paths: HashSet::new(),
+    })
 }
 
 fn run_opengrep_group(
@@ -827,12 +978,22 @@ fn run_opengrep(
         serde_json::to_string(&document.skipped_rules)?
     );
 
+    let scanned_paths = document
+        .paths
+        .scanned
+        .iter()
+        .map(|path| relative_target_path(path, target_directory))
+        .collect::<Result<HashSet<_>>>()?;
     let findings = document
         .results
         .into_iter()
         .map(|finding| normalize_finding(finding, target_directory, inspector_base))
         .collect::<Result<Vec<_>>>()?;
-    Ok(OpenGrepRun { findings, warnings })
+    Ok(OpenGrepRun {
+        findings,
+        warnings,
+        scanned_paths,
+    })
 }
 
 fn wait_for_child(
@@ -1034,6 +1195,141 @@ mod tests {
         time::{Duration, Instant},
     };
     use tempfile::tempdir;
+
+    fn reuse_test_client(
+        binary: PathBuf,
+        mode: crate::reuse_cache::CacheMode,
+    ) -> super::OpenGrepClient {
+        let directory = tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("rule.yml"),
+            r"
+rules:
+  - id: python-test-exec
+    message: Dynamic execution.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      evidence: composition
+      confidence: high
+      execution_context: import_time
+    pattern: exec(...)
+",
+        )
+        .unwrap();
+        super::OpenGrepClient {
+            api_client: reqwest::blocking::Client::new(),
+            download_client: reqwest::blocking::Client::new(),
+            base_url: "https://dragonfly-staging.vipyrsec.com".into(),
+            binary,
+            rules_directory: directory,
+            content_reuse_safe: true,
+            rules_hash: "snapshot".into(),
+            reuse_cache: crate::reuse_cache::ReuseCache::new(mode, 100, 1024 * 1024),
+        }
+    }
+
+    #[test]
+    fn installed_opengrep_reuses_across_packages_and_rewrites_locations() {
+        use crate::reuse_cache::{CacheMode, CacheStats};
+        let Some(binary) = std::env::var_os("OPENGREP_BIN").map(PathBuf::from) else {
+            return;
+        };
+        for mode in [CacheMode::Observe, CacheMode::Reuse] {
+            let client = reuse_test_client(binary.clone(), mode);
+            let job = crate::client::Job {
+                hash: "snapshot".into(),
+                name: "test".into(),
+                version: "1".into(),
+                distributions: Vec::new(),
+                attempt: 1,
+                assignment_id: "lease".into(),
+            };
+            for version in 1..=2 {
+                let source = tempdir().unwrap();
+                std::fs::write(source.path().join("danger.py"), "exec('print(1)')\n").unwrap();
+                std::fs::write(source.path().join("clean.py"), "print(1)\n").unwrap();
+                // A target without a supported language must not become a cached clean result.
+                std::fs::write(source.path().join("ignored.unknown"), "text\n").unwrap();
+                let mut target = PackageTarget::new().unwrap();
+                let plan = target
+                    .plan_distribution(source.path(), Instant::now() + SCAN_DEADLINE)
+                    .unwrap();
+                target
+                    .commit_distribution(
+                        plan,
+                        Url::parse(&format!("https://inspector.example/v{version}/")).unwrap(),
+                    )
+                    .unwrap();
+                let mut stats = CacheStats::new("test", mode);
+                let outcome = client
+                    .scan_prepared_package(&mut target, 1, Vec::new(), &job, &mut stats)
+                    .unwrap();
+                assert!(outcome.partial_reason.is_none());
+                assert_eq!(outcome.findings.len(), 1);
+                assert_eq!(outcome.findings[0].path, "danger.py");
+                assert!(outcome.findings[0]
+                    .inspector_url
+                    .contains(&format!("/v{version}/")));
+                assert_eq!(stats.inserted_files, if version == 1 { 2 } else { 0 });
+                assert_eq!(
+                    stats.reused_files,
+                    if version == 2 && mode == CacheMode::Reuse {
+                        2
+                    } else {
+                        0
+                    }
+                );
+                assert_eq!(
+                    stats.validated_files,
+                    if version == 2 && mode == CacheMode::Observe {
+                        2
+                    } else {
+                        0
+                    }
+                );
+                assert_eq!(stats.mismatched_files, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn installed_opengrep_does_not_cache_partial_package_results() {
+        use crate::reuse_cache::{CacheMode, CacheStats};
+        let Some(binary) = std::env::var_os("OPENGREP_BIN").map(PathBuf::from) else {
+            return;
+        };
+        let client = reuse_test_client(binary, CacheMode::Reuse);
+        let source = tempdir().unwrap();
+        std::fs::write(source.path().join("clean.py"), "print(1)\n").unwrap();
+        let mut target = PackageTarget::new().unwrap();
+        let plan = target
+            .plan_distribution(source.path(), Instant::now() + SCAN_DEADLINE)
+            .unwrap();
+        target
+            .commit_distribution(plan, Url::parse("https://inspector.example/").unwrap())
+            .unwrap();
+        let job = crate::client::Job {
+            hash: "snapshot".into(),
+            name: "test".into(),
+            version: "1".into(),
+            distributions: Vec::new(),
+            attempt: 1,
+            assignment_id: "lease".into(),
+        };
+        let mut stats = CacheStats::new("test", CacheMode::Reuse);
+        let outcome = client
+            .scan_prepared_package(
+                &mut target,
+                1,
+                vec!["incomplete download".into()],
+                &job,
+                &mut stats,
+            )
+            .unwrap();
+        assert!(outcome.partial_reason.is_some());
+        assert_eq!(stats.inserted_files, 0);
+    }
 
     #[test]
     fn shadow_origin_is_restricted_to_supported_apis() {

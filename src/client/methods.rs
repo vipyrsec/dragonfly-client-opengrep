@@ -44,7 +44,7 @@ pub fn fetch_opengrep_rules(
 pub fn send_opengrep_result(
     http_client: &Client,
     base_url: &str,
-    body: &models::OpenGrepScanResult,
+    body: &impl serde::Serialize,
 ) -> reqwest::Result<()> {
     http_client
         .put(format!("{base_url}/opengrep/package"))
